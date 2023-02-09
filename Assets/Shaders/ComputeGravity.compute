@@ -1,0 +1,681 @@
+#pragma kernel CSGravitySphere
+#pragma kernel CSGravityCube
+//#pragma kernel CSGravityCone
+#pragma kernel CSCollisionSphereSphere
+#pragma kernel CSCollisionSphereCube
+//#pragma kernel CSCollisionSphereCone
+#pragma kernel CSCollisionCubeCube
+//#pragma kernel CSCollisionCubeCone
+//#pragma kernel CSCollisionConeCone
+
+// Preluate din https://gist.github.com/mattatz/86fff4b32d198d0928d0fa4ff32cf6fa
+#define IDENTITY_MATRIX float4x4(1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1)
+
+float4 matrix_to_quaternion(float4x4 m)
+{
+    float tr = m[0][0] + m[1][1] + m[2][2];
+    float4 q = float4(0, 0, 0, 0);
+
+    if (tr > 0)
+    {
+        float s = sqrt(tr + 1.0) * 2; // S=4*qw 
+        q.w = 0.25 * s;
+        q.x = (m[2][1] - m[1][2]) / s;
+        q.y = (m[0][2] - m[2][0]) / s;
+        q.z = (m[1][0] - m[0][1]) / s;
+    }
+    else if ((m[0][0] > m[1][1]) && (m[0][0] > m[2][2]))
+    {
+        float s = sqrt(1.0 + m[0][0] - m[1][1] - m[2][2]) * 2; // S=4*qx 
+        q.w = (m[2][1] - m[1][2]) / s;
+        q.x = 0.25 * s;
+        q.y = (m[0][1] + m[1][0]) / s;
+        q.z = (m[0][2] + m[2][0]) / s;
+    }
+    else if (m[1][1] > m[2][2])
+    {
+        float s = sqrt(1.0 + m[1][1] - m[0][0] - m[2][2]) * 2; // S=4*qy
+        q.w = (m[0][2] - m[2][0]) / s;
+        q.x = (m[0][1] + m[1][0]) / s;
+        q.y = 0.25 * s;
+        q.z = (m[1][2] + m[2][1]) / s;
+    }
+    else
+    {
+        float s = sqrt(1.0 + m[2][2] - m[0][0] - m[1][1]) * 2; // S=4*qz
+        q.w = (m[1][0] - m[0][1]) / s;
+        q.x = (m[0][2] + m[2][0]) / s;
+        q.y = (m[1][2] + m[2][1]) / s;
+        q.z = 0.25 * s;
+    }
+
+    return q;
+}
+
+float4x4 quaternion_to_matrix(float4 quat)
+{
+    float4x4 m = float4x4(float4(0, 0, 0, 0), float4(0, 0, 0, 0), float4(0, 0, 0, 0), float4(0, 0, 0, 0));
+
+    float x = quat.x, y = quat.y, z = quat.z, w = quat.w;
+    float x2 = x + x, y2 = y + y, z2 = z + z;
+    float xx = x * x2, xy = x * y2, xz = x * z2;
+    float yy = y * y2, yz = y * z2, zz = z * z2;
+    float wx = w * x2, wy = w * y2, wz = w * z2;
+
+    m[0][0] = 1.0 - (yy + zz);
+    m[0][1] = xy - wz;
+    m[0][2] = xz + wy;
+
+    m[1][0] = xy + wz;
+    m[1][1] = 1.0 - (xx + zz);
+    m[1][2] = yz - wx;
+
+    m[2][0] = xz - wy;
+    m[2][1] = yz + wx;
+    m[2][2] = 1.0 - (xx + yy);
+
+    m[3][3] = 1.0;
+
+    return m;
+}
+
+float4 qmul(float4 q1, float4 q2)
+{
+    return float4(
+        q2.xyz * q1.w + q1.xyz * q2.w + cross(q1.xyz, q2.xyz),
+        q1.w * q2.w - dot(q1.xyz, q2.xyz)
+        //lhs.w * rhs.x + lhs.x * rhs.w + lhs.y * rhs.z - lhs.z * rhs.y, lhs.w * rhs.y + lhs.y * rhs.w + lhs.z * rhs.x - lhs.x * rhs.z, lhs.w * rhs.z + 
+        //lhs.z * rhs.w + lhs.x * rhs.y - lhs.y * rhs.x, lhs.w * rhs.w - lhs.x * rhs.x - lhs.y * rhs.y - lhs.z * rhs.z
+    );
+}
+
+float3 rotate_vector(float3 v, float4 r)
+{
+    float4 r_c = r * float4(-1, -1, -1, 1);
+    return qmul(r, qmul(float4(v, 0), r_c)).xyz;
+}
+
+// Data living only on GPU after initial setup
+struct PhysicsData
+{
+    float invMass;
+    float3 force;
+    float3 velocity;
+    float3 torque;
+    float3 angularVelocity;
+    float4x4 baseInverseInertiaTensor;
+    float4x4 inverseInertiaTensor;
+    float3 minBound;
+    float3 maxBound;
+};
+
+struct TransformData
+{
+    float3 pos;
+    float4 rot;
+    float scale;
+    float4x4 worldMatrix;
+    float4x4 localMatrix;
+};
+
+struct SphereData
+{
+    float radius;
+};
+
+struct CubeData
+{
+    float3 extents;
+};
+
+struct ConeData
+{
+    float boundingSphereRadius;
+};
+
+static const float3 GRAVITY = float3(0.0f, -9.81f, 0.0f);
+static const float RESTITUTION = 0.9f;
+
+RWStructuredBuffer<TransformData> tBufferSphere;
+RWStructuredBuffer<TransformData> tBufferCube;
+RWStructuredBuffer<TransformData> tBufferCone;
+
+RWStructuredBuffer<PhysicsData> pBufferSphere;
+RWStructuredBuffer<PhysicsData> pBufferCube;
+RWStructuredBuffer<PhysicsData> pBufferCone;
+
+RWStructuredBuffer<SphereData> sphereBuffer;
+RWStructuredBuffer<CubeData> cubeBuffer;
+RWStructuredBuffer<ConeData> coneBuffer;
+
+StructuredBuffer<float3> cubeVertices; 
+
+float _fixedDeltaTime;
+float3 minContainerBound;
+float3 maxContainerBound;
+
+void ClearForces(inout PhysicsData pBuffer)
+{
+    pBuffer.force = float3(0.0f, 0.0f, 0.0f);
+    pBuffer.torque = float3(0.0f, 0.0f, 0.0f);
+}
+
+float3 SphereContainerCollision(float3 center, float radius, inout float3 velocity)
+{
+    float dist;
+    float r2 = pow(radius, 2);
+    float3 cmin = minContainerBound;
+    float3 cmax = maxContainerBound;
+
+    for (int i = 0; i < 3; i++)
+    {
+        dist = pow(center[i] - cmin[i], 2);
+        if (dist <= r2)
+        {
+            center[i] = cmin[i] + radius;
+            velocity[i] = -RESTITUTION * velocity[i];
+        }
+        dist = pow(center[i] - cmax[i], 2);
+        if (dist <= r2)
+        {
+            center[i] = cmax[i] - radius;
+            velocity[i] = -RESTITUTION * velocity[i];
+        }
+    }
+    return center;
+}
+
+void ApplyGravity(inout PhysicsData pBuffer, inout TransformData tBuffer)
+{
+    float3 acceleration = pBuffer.force * pBuffer.invMass;
+    acceleration += GRAVITY;
+    pBuffer.velocity += GRAVITY * _fixedDeltaTime;
+    tBuffer.pos += pBuffer.velocity * _fixedDeltaTime;
+    
+    float4x4 R = quaternion_to_matrix(tBuffer.rot);
+    pBuffer.inverseInertiaTensor = mul(R, mul(pBuffer.baseInverseInertiaTensor, transpose(R)));
+    float3 angularAcceleration = mul(pBuffer.inverseInertiaTensor, pBuffer.torque);
+    
+    pBuffer.angularVelocity += angularAcceleration * _fixedDeltaTime;
+    float3 approx = _fixedDeltaTime * 0.5f * pBuffer.angularVelocity;
+    float4 deltaRot = qmul(float4(approx, 0.0f), tBuffer.rot);
+    deltaRot.x += tBuffer.rot.x;
+    deltaRot.y += tBuffer.rot.y;
+    deltaRot.z += tBuffer.rot.z;
+    deltaRot.w += tBuffer.rot.w;
+    tBuffer.rot = normalize(deltaRot);
+    
+    ClearForces(pBuffer);
+}
+
+[numthreads(32, 1, 1)]
+void CSGravitySphere(uint3 id : SV_DispatchThreadID)
+{
+    uint len, stride;
+    tBufferSphere.GetDimensions(len, stride);
+    if (id.x >= len)
+        return;
+    
+    tBufferSphere[id.x].pos = SphereContainerCollision(tBufferSphere[id.x].pos, sphereBuffer[id.x].radius,
+                                                    pBufferSphere[id.x].velocity);
+    
+    ApplyGravity(pBufferSphere[id.x], tBufferSphere[id.x]);
+}
+
+float distance2(float3 x, float3 y)
+{
+    float3 tmp = x - y;
+    return dot(tmp, tmp);
+}
+
+float length2(float3 x)
+{
+    return dot(x, x);
+}
+
+bool SphereSphereIntersect(float3 center1, float radius1, float3 center2, float radius2)
+{
+    return distance2(center1, center2) < pow(radius1 + radius2, 2);
+}
+
+struct Contact
+{
+    float3 norm;
+    float overlapDist;
+    float3 contactA;
+    float3 contactB;
+};
+
+void AddLinearImpulse(inout PhysicsData pBuffer, float3 force)
+{
+    pBuffer.velocity += force * pBuffer.invMass;
+}
+
+void AddAngularImpulse(inout PhysicsData pBuffer, float3 force)
+{
+    pBuffer.angularVelocity += mul(pBuffer.inverseInertiaTensor, force);
+}
+
+void ResolveCollision(inout PhysicsData pBuffer1, inout TransformData tBuffer1, 
+                      inout PhysicsData pBuffer2, inout TransformData tBuffer2, Contact contactInfo)
+{
+    float3 norm = contactInfo.norm;
+    float overlapDist = contactInfo.overlapDist;
+    float3 contactA = contactInfo.contactA;
+    float3 contactB = contactInfo.contactB;
+
+    float invMass1 = pBuffer1.invMass;
+    float invMass2 = pBuffer2.invMass;
+    float massSum = invMass1 + invMass2;
+    tBuffer1.pos -= norm * overlapDist * invMass1 / massSum;
+    tBuffer2.pos += norm * overlapDist * invMass2 / massSum;
+
+    float3 rA = contactA - tBuffer1.pos;
+    float3 rB = contactB - tBuffer2.pos;
+
+    float3 angularA = cross(pBuffer1.angularVelocity, rA);
+    float3 angularB = cross(pBuffer2.angularVelocity, rB);
+    float3 fullVelocityA = pBuffer1.velocity + angularA;
+    float3 fullVelocityB = pBuffer2.velocity + angularB;
+    float3 fullVelocityDiff = fullVelocityA - fullVelocityB;
+
+    float3 thetaA = cross(
+            mul(pBuffer1.inverseInertiaTensor, cross(rA, norm)),
+            rA);
+    float3 thetaB = cross(
+            mul(pBuffer2.inverseInertiaTensor, cross(rB, norm)),
+            rB);
+    float angularFactor = dot(thetaA + thetaB, norm);
+
+    
+    float e = RESTITUTION;
+    float impulse = -(1.0f + e) *
+            dot(fullVelocityDiff, norm) /
+            (pBuffer1.invMass + pBuffer2.invMass + angularFactor);
+    float3 impulseNorm = impulse * norm;
+
+    AddLinearImpulse(pBuffer1, impulseNorm);
+    AddLinearImpulse(pBuffer2, -impulseNorm);
+
+    AddAngularImpulse(pBuffer1, cross(rA, impulseNorm));
+    AddAngularImpulse(pBuffer2, -cross(rB, impulseNorm));
+}
+
+void ResolveCollisionContainer(inout PhysicsData pBuffer1, inout TransformData tBuffer1, Contact contactInfo)
+{
+    float3 norm = contactInfo.norm;
+    float overlapDist = contactInfo.overlapDist;
+    float3 contactA = contactInfo.contactA;
+    float3 contactB = contactInfo.contactB;
+
+    tBuffer1.pos -= norm * overlapDist;
+
+    float3 rA = contactA - tBuffer1.pos;
+
+    float3 angularA = cross(pBuffer1.angularVelocity, rA);
+    float3 fullVelocityA = pBuffer1.velocity + angularA;
+    float3 fullVelocityDiff = fullVelocityA;
+
+    float3 thetaA = cross(
+            mul(pBuffer1.inverseInertiaTensor, cross(rA, norm)),
+            rA);
+    float angularFactor = dot(thetaA, norm);
+    
+    float e = RESTITUTION;
+    float impulse = -(1.0f + e) *
+            dot(fullVelocityDiff, norm) /
+            (pBuffer1.invMass + angularFactor);
+    float3 impulseNorm = impulse * norm;
+
+    AddLinearImpulse(pBuffer1, impulseNorm);
+    AddAngularImpulse(pBuffer1, cross(rA, impulseNorm));
+}
+
+uint2 GetCompactUpperIndices(uint k, uint n)
+{
+    // https://stackoverflow.com/questions/27086195/linear-index-upper-triangular-matrix
+    int i = n - 2 - floor(sqrt(-8 * k + 4 * n * (n - 1) - 7) / 2.0 - 0.5);
+    int j = k + i + 1 - n * (n - 1) / 2 + (n - i) * ((n - i) - 1) / 2;
+    
+    return int2(i, j);
+}
+
+[numthreads(32, 1, 1)]
+void CSCollisionSphereSphere(uint3 id : SV_DispatchThreadID)
+{
+    uint n, stride;
+    tBufferSphere.GetDimensions(n, stride);
+    if (id.x >= n * (n - 1) / 2)
+        return;
+    
+    uint2 ij = GetCompactUpperIndices(id.x, n);
+    uint i = ij.x;
+    uint j = ij.y;
+    
+    if (SphereSphereIntersect(tBufferSphere[i].pos, sphereBuffer[i].radius,
+            tBufferSphere[j].pos, sphereBuffer[j].radius))
+    {
+        float dist = distance(tBufferSphere[i].pos, tBufferSphere[j].pos);
+
+        Contact contactInfo;
+        // Normal towards other object
+        contactInfo.norm = normalize(tBufferSphere[j].pos - tBufferSphere[i].pos);
+        contactInfo.contactA = tBufferSphere[i].pos + contactInfo.norm * sphereBuffer[i].radius;
+        contactInfo.contactB = tBufferSphere[j].pos - contactInfo.norm * sphereBuffer[j].radius;
+        contactInfo.overlapDist = sphereBuffer[i].radius + sphereBuffer[j].radius - dist;
+
+        ResolveCollision(pBufferSphere[i], tBufferSphere[i], 
+                         pBufferSphere[j], tBufferSphere[j], contactInfo);
+    }
+}
+
+
+bool InsideContainer(StructuredBuffer<float3> vertBuffer, float4x4 localToWorld, out Contact contactInfo)
+{
+    float3 minCont = minContainerBound;
+    float3 maxCont = maxContainerBound;
+    float3 points[10];
+    float3 normals[10];
+    float minOverlap = 1e9f;
+
+    int vertices = 0;
+    
+    uint len, stride;
+    vertBuffer.GetDimensions(len, stride);
+
+    int addedPoints = 0;
+    for (int i = 0; i < len; i++)
+    {
+        if (vertices >= 8)
+            break;
+        
+        float3 vertexWorld = mul(localToWorld, float4(vertBuffer[i], 1.0f));
+        for (int j = 0; j < 3; j++)
+        {
+            if (vertexWorld[j] < minCont[j])
+            {
+                float3 normal = float3(0.0f, 0.0f, 0.0f);
+                normal[j] = -1;
+                points[addedPoints] = vertexWorld;
+                normals[addedPoints] = normal;
+                addedPoints++;
+                
+                minOverlap = min(minOverlap, minCont[j] - vertexWorld[j]);
+                break;
+            }
+            else if (vertexWorld[j] > maxCont[j])
+            {
+                float3 normal = float3(0.0f, 0.0f, 0.0f);
+                normal[j] = 1;
+                points[addedPoints] = vertexWorld;
+                normals[addedPoints] = normal;
+                addedPoints++;
+                
+                minOverlap = min(minOverlap, vertexWorld[j] - maxCont[j]);
+                break;
+            }
+        }
+        if (addedPoints == 10)
+            break;
+        vertices++;
+    }
+    if (addedPoints > 0)
+    {
+        float3 sumPoints = float3(0.0f, 0.0f, 0.0f);
+        float3 sumNormals = float3(0.0f, 0.0f, 0.0f);
+        for (int i = 0; i < addedPoints; i++)
+        {
+            sumPoints += points[i];
+            sumNormals += normals[i];
+        }
+
+        contactInfo.contactA = sumPoints / addedPoints;
+        contactInfo.contactB = contactInfo.contactA;
+        contactInfo.norm = normalize(sumNormals);
+        contactInfo.overlapDist = minOverlap;
+        return false;
+    }
+    
+    return true;
+}
+
+[numthreads(32, 1, 1)]
+void CSGravityCube(uint3 id : SV_DispatchThreadID)
+{
+    uint len, stride;
+    tBufferCube.GetDimensions(len, stride);
+    if (id.x >= len)
+        return;
+    
+    Contact contactInfo;
+    if (!InsideContainer(cubeVertices, tBufferCube[id.x].worldMatrix, contactInfo))
+    {
+        ResolveCollisionContainer(pBufferCube[id.x], tBufferCube[id.x], contactInfo);
+    }
+    
+    ApplyGravity(pBufferCube[id.x], tBufferCube[id.x]);
+}
+
+void SphereOBBCollision(inout TransformData tBufferSph, inout PhysicsData pBufferSph, inout SphereData sphere,
+                        inout TransformData tBufferObb, inout PhysicsData pBufferObb)
+{
+    float3 localCenter = mul(tBufferObb.localMatrix, float4(tBufferSph.pos, 1.0f)).xyz;
+    float localRadius = sphere.radius / tBufferObb.scale;
+    float3 localExtents = (pBufferObb.maxBound - pBufferObb.minBound) * 0.5f;
+
+    float3 dir = localCenter;
+    float3 closestPoint = float3(0.0f, 0.0f, 0.0f);
+    for (int i = 0; i < 3; i++)
+    {
+        closestPoint[i] = clamp(dir[i], -localExtents[i], localExtents[i]);
+    }
+
+    float3 dirToContact = closestPoint - localCenter;
+    if (length2(dirToContact) < localRadius * localRadius)
+    {
+            // Collision detected
+        Contact contactInfo;
+        contactInfo.norm = normalize(dirToContact);
+        contactInfo.contactA = contactInfo.norm * localRadius;
+        contactInfo.contactB = closestPoint;
+            //contactInfo.overlapDist = localRadius - dirToContact.magnitude;
+
+        contactInfo.norm = mul(tBufferObb.worldMatrix, float4(contactInfo.norm, 0.0f));
+        contactInfo.contactA = mul(tBufferObb.worldMatrix, float4(contactInfo.contactA, 1.0f));
+        contactInfo.contactB = mul(tBufferObb.worldMatrix, float4(contactInfo.contactB, 1.0f));
+        contactInfo.overlapDist = sphere.radius -
+                distance(mul(tBufferObb.worldMatrix, float4(closestPoint, 1.0f)).xyz, tBufferSph.pos);
+
+        ResolveCollision(pBufferSph, tBufferSph, pBufferObb, tBufferObb, contactInfo);
+    }
+}
+
+[numthreads(8, 8, 1)]
+void CSCollisionSphereCube(uint3 id : SV_DispatchThreadID)
+{
+    uint n, stride1;
+    uint m, stride2;
+    tBufferSphere.GetDimensions(n, stride1);
+    tBufferCube.GetDimensions(m, stride2);
+    
+    if (id.x >= n || id.y >= m)
+        return;
+    
+    SphereOBBCollision(tBufferSphere[id.x], pBufferSphere[id.x], sphereBuffer[id.x],
+                       tBufferCube[id.y], pBufferCube[id.y]);
+}
+
+bool CheckNonOverlap(float R, float R01, float3 axis, inout Contact contactInfo)
+{
+    float dif = R - R01;
+    if (dif > 0.0f)
+        return true;
+
+    if (all(axis == float3(0.0f, 0.0f, 0.0f)))
+        return false;
+
+    //contactInfo.contactA = contactInfo.contactA;
+    //contactInfo.contactB = contactInfo.contactB;
+    //contactInfo.overlapDist = contactInfo.overlapDist;
+    //contactInfo.norm = contactInfo.norm;
+    
+    if (contactInfo.overlapDist > -dif)
+    {
+        contactInfo.overlapDist = -dif;
+        contactInfo.norm = axis;
+    }
+
+    return false;
+}
+
+bool testSAT(inout TransformData tBuffer1, CubeData cData1, 
+             inout TransformData tBuffer2, CubeData cData2, inout Contact contactInfo)
+{
+    float3 right   = float3(1.0f, 0.0f, 0.0f);
+    float3 up      = float3(0.0f, 1.0f, 0.0f);
+    float3 forward = float3(0.0f, 0.0f, 1.0f);
+    float3 A[3] = { rotate_vector(right, tBuffer1.rot), rotate_vector(up, tBuffer1.rot), rotate_vector(forward, tBuffer1.rot) };
+    float3 B[3] = { rotate_vector(right, tBuffer2.rot), rotate_vector(up, tBuffer2.rot), rotate_vector(forward, tBuffer2.rot) };
+    float3 a = cData1.extents;
+    float3 b = cData2.extents;
+    float3 D = tBuffer2.pos - tBuffer1.pos;
+    float4x4 C = IDENTITY_MATRIX;
+    float4x4 Ca = IDENTITY_MATRIX;
+    for (int i = 0; i < 3; i++)
+        for (int j = 0; j < 3; j++)
+        {
+            C[i][j] = dot(A[i], B[j]);
+            Ca[i][j] = abs(C[i][j]);
+        }
+
+    contactInfo.overlapDist = 1e9f;
+
+    float A0D = dot(A[0], D);
+    float R = abs(A0D);
+    float R0 = a[0];
+    float R1 = b[0] * Ca[0][0] + b[1] * Ca[0][1] + b[2] * Ca[0][2];
+    if (CheckNonOverlap(R, R0 + R1, A[0], contactInfo))
+        return false;
+
+    float A1D = dot(A[1], D);
+    R = abs(A1D);
+    R0 = a[1];
+    R1 = b[0] * Ca[1][0] + b[1] * Ca[1][1] + b[2] * Ca[1][2];
+    if (CheckNonOverlap(R, R0 + R1, A[1], contactInfo))
+        return false;
+
+    float A2D = dot(A[2], D);
+    R = abs(A2D);
+    R0 = a[2];
+    R1 = b[0] * Ca[2][0] + b[1] * Ca[2][1] + b[2] * Ca[2][2];
+    if (CheckNonOverlap(R, R0 + R1, A[2], contactInfo))
+        return false;
+
+    R = abs(dot(B[0], D));
+    R0 = a[0] * Ca[0][0] + a[1] * Ca[1][0] + a[2] * Ca[2][0];
+    R1 = b[0];
+    if (CheckNonOverlap(R, R0 + R1, B[0], contactInfo))
+        return false;
+
+    R = abs(dot(B[1], D));
+    R0 = a[0] * Ca[0][1] + a[1] * Ca[1][1] + a[2] * Ca[2][1];
+    R1 = b[1];
+    if (CheckNonOverlap(R, R0 + R1, B[1], contactInfo))
+        return false;
+
+    R = abs(dot(B[2], D));
+    R0 = a[0] * Ca[0][2] + a[1] * Ca[1][2] + a[2] * Ca[2][2];
+    R1 = b[2];
+    if (CheckNonOverlap(R, R0 + R1, B[2], contactInfo))
+        return false;
+
+    R = abs(C[1][0] * A2D - C[2][0] * A1D);
+    R0 = a[1] * Ca[2][0] + a[2] * Ca[1][0];
+    R1 = b[1] * Ca[0][2] + b[2] * Ca[0][1];
+    if (CheckNonOverlap(R, R0 + R1, normalize(cross(A[0], B[0])), contactInfo))
+        return false;
+
+    R = abs(C[1][1] * A2D - C[2][1] * A1D);
+    R0 = a[1] * Ca[2][1] + a[2] * Ca[1][1];
+    R1 = b[0] * Ca[0][2] + b[2] * Ca[0][0];
+    if (CheckNonOverlap(R, R0 + R1, normalize(cross(A[0], B[1])), contactInfo))
+        return false;
+
+    R = abs(C[1][2] * A2D - C[2][2] * A1D);
+    R0 = a[1] * Ca[2][2] + a[2] * Ca[1][2];
+    R1 = b[0] * Ca[0][1] + b[1] * Ca[0][0];
+    if (CheckNonOverlap(R, R0 + R1, normalize(cross(A[0], B[2])), contactInfo))
+        return false;
+
+    R = abs(C[2][0] * A0D - C[0][0] * A2D);
+    R0 = a[0] * Ca[2][0] + a[2] * Ca[0][0];
+    R1 = b[1] * Ca[1][2] + b[2] * Ca[1][1];
+    if (CheckNonOverlap(R, R0 + R1, normalize(cross(A[1], B[0])), contactInfo))
+        return false;
+
+    R = abs(C[2][1] * A0D - C[0][1] * A2D);
+    R0 = a[0] * Ca[2][1] + a[2] * Ca[0][1];
+    R1 = b[0] * Ca[1][2] + b[2] * Ca[1][0];
+    if (CheckNonOverlap(R, R0 + R1, normalize(cross(A[1], B[1])), contactInfo))
+        return false;
+
+    R = abs(C[2][2] * A0D - C[0][2] * A2D);
+    R0 = a[0] * Ca[2][2] + a[2] * Ca[0][2];
+    R1 = b[0] * Ca[1][1] + b[1] * Ca[1][0];
+    if (CheckNonOverlap(R, R0 + R1, normalize(cross(A[1], B[2])), contactInfo))
+        return false;
+
+    R = abs(C[0][0] * A1D - C[1][0] * A0D);
+    R0 = a[0] * Ca[1][0] + a[1] * Ca[0][0];
+    R1 = b[1] * Ca[2][2] + b[2] * Ca[2][1];
+    if (CheckNonOverlap(R, R0 + R1, normalize(cross(A[2], B[0])), contactInfo))
+        return false;
+
+    R = abs(C[0][1] * A1D - C[1][1] * A0D);
+    R0 = a[0] * Ca[1][1] + a[1] * Ca[0][1];
+    R1 = b[0] * Ca[2][2] + b[2] * Ca[2][0];
+    if (CheckNonOverlap(R, R0 + R1, normalize(cross(A[2], B[1])), contactInfo))
+        return false;
+
+    R = abs(C[0][2] * A1D - C[1][2] * A0D);
+    R0 = a[0] * Ca[1][2] + a[1] * Ca[0][2];
+    R1 = b[0] * Ca[2][1] + b[1] * Ca[2][0];
+    if (CheckNonOverlap(R, R0 + R1, normalize(cross(A[2], B[2])), contactInfo))
+        return false;
+
+    // Collision Detected (finally)
+    float extentSum = cData1.extents[0] + cData2.extents[0]; 
+    float3 dir = tBuffer2.pos - tBuffer1.pos;
+    contactInfo.contactA = tBuffer1.pos + dir * (extentSum - cData1.extents[0]) / extentSum;
+    contactInfo.contactB = tBuffer2.pos - dir * (extentSum - cData2.extents[0]) / extentSum;
+    contactInfo.norm *= sign(dot(dir, contactInfo.norm));
+
+    //ResolveCollision(otherCube, contactInfo);
+
+    return true;
+}
+
+[numthreads(32, 1, 1)]
+void CSCollisionCubeCube(uint3 id : SV_DispatchThreadID)
+{
+    uint n, stride;
+    tBufferCube.GetDimensions(n, stride);
+    if (id.x >= n * (n - 1) / 2)
+        return;
+    
+    uint2 ij = GetCompactUpperIndices(id.x, n);
+    uint i = ij.x;
+    uint j = ij.y;
+    
+    Contact contactInfo;
+    contactInfo.contactA = float3(0.0f, 0.0f, 0.0f);
+    contactInfo.contactB = float3(0.0f, 0.0f, 0.0f);
+    contactInfo.norm = float3(0.0f, 0.0f, 0.0f);
+    contactInfo.overlapDist = 1e9;
+    
+    if (testSAT(tBufferCube[i], cubeBuffer[i], tBufferCube[j], cubeBuffer[j], contactInfo))
+    {
+        ResolveCollision(pBufferCube[i], tBufferCube[i],
+                         pBufferCube[j], tBufferCube[j], contactInfo);
+    }
+}
